@@ -1,0 +1,180 @@
+Map.addLayer(presences, {color: 'red'}, 'Cardinalis sinaltius');
+
+// code to try to reduce/ randomly sample points 
+var Random = ee.FeatureCollection.randomPoints(presences, 2000, 42);
+
+var countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017");
+Map.addLayer(polygon);
+
+// Environmental data //
+// Load in bioclimatic variables from WorldClim 
+
+var worldclim = ee.Image("WORLDCLIM/V1/BIO");
+print(worldclim);
+// Load in terraclim data
+var terraclim = ee.ImageCollection("IDAHO_EPSCOR/TERRACLIMATE");
+// Load in terrain data
+var elev = ee.Image("USGS/SRTMGL1_003");
+// // Load in Landcover type
+ var landcover = ee.Image('COPERNICUS/Landcover/100m/Proba-V-C3/Global/2019');
+// // Load in soils data
+// This doesn't seem to be working, but is often a valuable contribution for SDMs for plants in my experience
+// Hopefully it will be available soon
+// var soils_grid = ee.Image("projects/soilgrids-isric/layer_name");
+
+var aoi = countries.filterBounds(polygon).map(function(f) {
+  return f.intersection(polygon, 1);//1 refers to the maxError argument
+});
+
+var aoi = aoi.union();
+Map.addLayer(polygon,{}, "Polygon", false);
+Map.addLayer(aoi, {},"Area of interest", false);
+
+
+// // Terraclim is an ImageCollection with data from 1958 to 2019
+// // We want a single mean value over this time period
+// // So we select our variables of interest and then calculate a mean for each band over the time period
+var terraclim = ee.Image(terraclim.select(['aet','def','pdsi','pet','soil']).mean());
+
+// Terrain 
+// We want to have the elevation and then calculate the aspect and slope
+// We do this using the family of ee.Terrain functions and adding the bands together
+var terrain = elev.addBands(ee.Terrain.aspect(elev)).addBands(ee.Terrain.slope(elev));
+
+// //  // We now want to merge our full environmental covariate dataset together, using addBands()
+// //  // At the same time we can now clip it to our area of interest
+var vars = worldclim.addBands(terraclim).addBands(terrain).clip(aoi);
+// Using this method, you can add in extra bands to your predictor variable from any Image/ImageCollection
+print('Check all covariates:', vars);
+
+
+// // Make sure all of the presence points are within our AOI
+var filtered_locs = presences.filterBounds(aoi);
+// How many presence points do we have?
+print('No. of localities:', filtered_locs.size());
+
+// //add a presence property to each feature i.e. a value of 1 to represent presence
+var Presence = filtered_locs.map(function(feature){
+  return feature.set('Presence', 1);
+});
+
+// //create random pseudo-absence points and add 0 value to the presence property for absence
+// // check the Docs for the randomPoints function; requires region, number of points to generate & a seed
+// Filter by the same number of presence points we have. Some studies suggest using over a thousand 
+var pAbsencePoints = ee.FeatureCollection.randomPoints(aoi, filtered_locs.size(), 42).map(function(feature){
+  return feature.set('Presence', 0); // we then add 0s to all pseudo-absences #filtered_locs.size()
+});
+// IMPORTANT!!! Change how many points you are using for psuedo absence points. Do multiple analysis, this step is senative and can bias result 
+// // You need to be careful with how you chose your pseudo-absences...
+//  Create buffer points, or make sure that they are not too clsoe to each other? 
+
+// // Add pseudo-absence points to the map
+//  Take our presences (1) and merge with psuedo-presence(0)
+Map.addLayer(pAbsencePoints, {color: "gray"}, "Pseudo-absence points", false);
+
+
+//Merge the presence and pseudo-absence points into a single feature
+var points = Presence.merge(pAbsencePoints);
+// print('Check the full points dataset:', points);
+
+// // For later model evaluation, it is important to have a set of data for 'training' the 
+// // model and another set of data for 'testing' the model
+
+// // To do this, we will split the data into 80% for training and 20% for testing
+// // Add a random column by default named 'random'
+var new_table = points.randomColumn({seed: 42}); 
+var training = new_table.filter(ee.Filter.lt('random', 0.80));
+// print("Check training data:", training);
+var test = new_table.filter(ee.Filter.gte('random', 0.80));
+// print("Check test data:", test);
+
+// // Extract the environmental variable values for each point
+// // Sampling using sampleRegions()
+var trainingData = vars.sampleRegions({
+  collection: training,
+  properties: ['Presence'],
+  geometries: true,
+  scale: 1000
+});
+// print('Check sampled data:', trainingData.limit(5));
+
+// // // At this point, many users may want to export the locality data, together with 
+// // // the covariate data to use it in a different program where there is more support
+// // // for SDMs. So we will export the data before continuing. You can export it as 
+// // // a shapefile or csv
+
+Export.table.toDrive({collection: trainingData, 
+                      description: 'Card_sin_sampled',
+                     // fileFormat: 'SHP'});
+                      fileFormat: 'csv'});
+
+
+// // We will now fit a Classifier, using Random Forest
+
+// Pull out the label and band names for the models
+var label = 'Presence';
+var bands = vars.bandNames();
+
+// We need to specificy the number of trees required; we'll use 100 trees, which can be a good balance
+// between under/over-fitting
+var model = ee.Classifier.smileRandomForest({numberOfTrees: 100})
+                            .setOutputMode('PROBABILITY') 
+                            // .setOutputMode('CLASSIFICATION') // Map of zeros/ones of pres/absence
+                            .train(trainingData, label, bands);
+// print("Check model output:", model);
+
+// ///////////////////
+// // Visualisation //
+// ///////////////////
+
+// Variable importance as Gini index
+var importance = model.explain().aside(print,'explain model') // with extra function, print out what is happening inoncsole 
+                  .get('importance').aside(print, 'Check model importance');
+
+// Convert the importance values into a feature for plotting
+var importance_plot = ee.FeatureCollection(ee.Feature(null, ee.Dictionary(importance)
+                      // .rename(['bio01','bio05','bio06','bio07','bio08','bio12','bio16','bio17'],
+                      //         ['Ann_mean_T','Max_T_warmest_month','Min_T_coldest_month',
+                      //         'T_Ann_range','Mean_T_wettest_quarter','Ann_P',
+                      //         'P_wettest_quarter','P_driest_quarter'])
+                               ));
+print('Check importance values:', importance_plot);
+
+// Plot the resulting variable importance in a bar chart
+var chart =
+ui.Chart.feature.byProperty(importance_plot)
+.setChartType('ColumnChart')
+.setOptions({
+title: 'Random Forest Variable Importance',
+legend: {position: 'none'},
+hAxis: {title: 'Covariates'},
+vAxis: {title: 'Importance'}
+});
+print(chart);
+
+// // Classify the image with the same bands used for training.
+// Use predict for predicting models
+var prediction = vars.classify(model); 
+
+// // Add in custom palette
+var palettes = require('users/gena/packages:palettes');
+var palette_mag = palettes.matplotlib.magma[7];
+
+// // Display the predicted probability of occurence results.
+Map.addLayer(prediction, {palette: palette_mag},'Probability of occurence (RF)', false);
+
+// For an ensemble approach, let's classify a model using MaxEnt
+var model2 = ee.Classifier.gmoMaxEnt()
+                            .setOutputMode('PROBABILITY')
+                            .train(trainingData, label, bands);
+var prediction2 = vars.classify(model2);
+
+Map.addLayer(prediction2, {palette: palette_mag},'Probability of occurence (MaxEnt)', false);
+
+var collectionFromImages = ee.ImageCollection.fromImages(
+  [ee.Image(prediction), ee.Image(prediction2)]);
+print('Check collectionFromImages:', collectionFromImages);
+
+var ensemble_prediction = collectionFromImages.mean()  // Based on confidence in model 
+
+Map.addLayer(ensemble_prediction, {palette: palette_mag},'Probability of occurence (ensemble)', false);
